@@ -104,6 +104,10 @@ const SDK_RESERVED_BUILTIN_TOOL_NAMES = new Set([
 	WRITE_TODOS_TOOL_NAME,
 ]);
 
+function getToolNames(tool: BuiltTool): string[] {
+	return [...new Set([tool.name, ...(tool.legacyNames ?? [])])];
+}
+
 function configuredSubAgentNotFound(request: DelegateSubAgentRequest): DelegateSubAgentToolOutput {
 	return {
 		status: 'failed',
@@ -307,6 +311,12 @@ export class Agent implements BuiltAgent, AgentBuilder {
 	tool(t: ToolParameter | ToolParameter[]): this {
 		const tools = Array.isArray(t) ? t : [t];
 		const builtTools = tools.map((tool) => ('build' in tool ? tool.build() : tool));
+		const staticCollisions = findDuplicateToolNamesForRegistration(this.tools, builtTools);
+		if (staticCollisions.length > 0) {
+			throw new Error(
+				`Static tool name collision — the following tool names resolve to duplicates: ${staticCollisions.join(', ')}`,
+			);
+		}
 		for (const built of builtTools) {
 			this.assertToolRegistrationAllowed(built);
 		}
@@ -331,8 +341,14 @@ export class Agent implements BuiltAgent, AgentBuilder {
 	/** Add tools that are searchable through `search_tools` and activated on demand with `load_tool`. */
 	deferredTool(t: ToolParameter | ToolParameter[], options?: DeferredToolOptions): this {
 		const tools = Array.isArray(t) ? t : [t];
-		for (const tool of tools) {
-			const built = 'build' in tool ? tool.build() : tool;
+		const builtTools = tools.map((tool) => ('build' in tool ? tool.build() : tool));
+		const deferredCollisions = findDuplicateToolNamesForRegistration(this.deferredTools, builtTools);
+		if (deferredCollisions.length > 0) {
+			throw new Error(
+				`Deferred tool name collision — the following tool names resolve to duplicates or reserved tools: ${deferredCollisions.join(', ')}`,
+			);
+		}
+		for (const built of builtTools) {
 			this.assertReservedSdkBuiltInToolName(built);
 			this.deferredTools.push(built);
 		}
@@ -1058,7 +1074,12 @@ export class Agent implements BuiltAgent, AgentBuilder {
 			);
 		}
 
-		const staticNames = new Set(finalStaticTools.map((t) => t.name));
+		const staticNames = new Set<string>();
+		for (const tool of finalStaticTools) {
+			for (const toolName of getToolNames(tool)) {
+				staticNames.add(toolName);
+			}
+		}
 		const reservedDeferredToolNames = new Set([
 			SEARCH_TOOLS_TOOL_NAME,
 			LOAD_TOOL_TOOL_NAME,
@@ -1067,14 +1088,16 @@ export class Agent implements BuiltAgent, AgentBuilder {
 		const deferredNames = new Set<string>();
 		const deferredCollisions: string[] = [];
 		for (const tool of finalDeferredTools) {
-			if (
-				staticNames.has(tool.name) ||
-				reservedDeferredToolNames.has(tool.name) ||
-				deferredNames.has(tool.name)
-			) {
-				deferredCollisions.push(tool.name);
+			for (const toolName of getToolNames(tool)) {
+				if (
+					staticNames.has(toolName) ||
+					reservedDeferredToolNames.has(toolName) ||
+					deferredNames.has(toolName)
+				) {
+					deferredCollisions.push(toolName);
+				}
+				deferredNames.add(toolName);
 			}
-			deferredNames.add(tool.name);
 		}
 		if (deferredCollisions.length > 0) {
 			throw new Error(
@@ -1424,8 +1447,10 @@ export class Agent implements BuiltAgent, AgentBuilder {
 	}
 
 	private assertToolRegistrationAllowed(tool: BuiltTool): void {
-		this.assertToolNameAvailable(tool.name);
-		this.assertReservedSdkBuiltInToolName(tool);
+		for (const toolName of getToolNames(tool)) {
+			this.assertToolNameAvailable(toolName);
+			this.assertReservedSdkBuiltInToolName(tool, toolName);
+		}
 	}
 
 	private assertToolNameAvailable(toolName: string): void {
@@ -1434,15 +1459,16 @@ export class Agent implements BuiltAgent, AgentBuilder {
 		throw new Error(`Tool name "${toolName}" is reserved for runtime skills`);
 	}
 
-	private assertReservedSdkBuiltInToolName(tool: BuiltTool): void {
-		if (!SDK_RESERVED_BUILTIN_TOOL_NAMES.has(tool.name)) return;
+	private assertReservedSdkBuiltInToolName(tool: BuiltTool, toolNameOverride?: string): void {
+		const toolName = toolNameOverride ?? tool.name;
+		if (!SDK_RESERVED_BUILTIN_TOOL_NAMES.has(toolName)) return;
 		if (isDelegateSubAgentTool(tool)) {
-			if (tool.name === DELEGATE_SUB_AGENT_TOOL_NAME) return;
+			if (toolName === DELEGATE_SUB_AGENT_TOOL_NAME && tool.name === DELEGATE_SUB_AGENT_TOOL_NAME) return;
 		} else if (isSdkOwnedBuiltInTool(tool)) {
-			return;
+			if (toolName === tool.name) return;
 		}
 
-		throw new Error(`Tool name "${tool.name}" is reserved for SDK built-in tools`);
+		throw new Error(`Tool name "${toolName}" is reserved for SDK built-in tools`);
 	}
 
 	private removeRuntimeSkillTools(): void {
@@ -1495,14 +1521,38 @@ export function filterInlineSubAgentTools<T extends { readonly name: string }>(
 	return tools.filter((tool) => !blocked.has(tool.name) && !isDelegateSubAgentTool(tool));
 }
 
+function findDuplicateToolNamesForRegistration(existingTools: BuiltTool[], newTools: BuiltTool[]): string[] {
+	const seen = new Set<string>();
+	const duplicates = new Set<string>();
+
+	for (const tool of existingTools) {
+		for (const toolName of getToolNames(tool)) {
+			seen.add(toolName);
+		}
+	}
+
+	for (const tool of newTools) {
+		for (const toolName of getToolNames(tool)) {
+			if (seen.has(toolName)) {
+				duplicates.add(toolName);
+			}
+			seen.add(toolName);
+		}
+	}
+
+	return [...duplicates].sort();
+}
+
 function findDuplicateToolNames(tools: BuiltTool[]): string[] {
 	const seen = new Set<string>();
 	const duplicates = new Set<string>();
 	for (const tool of tools) {
-		if (seen.has(tool.name)) {
-			duplicates.add(tool.name);
+		for (const toolName of getToolNames(tool)) {
+			if (seen.has(toolName)) {
+				duplicates.add(toolName);
+			}
+			seen.add(toolName);
 		}
-		seen.add(tool.name);
 	}
 	return [...duplicates].sort();
 }
