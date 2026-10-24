@@ -40,6 +40,36 @@ describe('SDK reserved built-in tool names', () => {
 		},
 	);
 
+	it.each([DELEGATE_SUB_AGENT_TOOL_NAME, WRITE_TODOS_TOOL_NAME])(
+		'rejects a custom tool with a legacy name of %s',
+		(toolName) => {
+			const tool = new Tool('custom')
+				.description('Custom tool')
+				.legacyNames(toolName)
+				.input(z.object({}))
+				.handler(async () => await Promise.resolve({ ok: true }))
+				.build();
+
+			expect(() => makeAgent().tool(tool)).toThrow(
+				`Tool name "${toolName}" is reserved for SDK built-in tools`,
+			);
+		},
+	);
+
+	it('rejects a static tool whose legacy name collides with another tool name', () => {
+		const first = makeCustomTool('first');
+		const second = new Tool('second')
+			.description('Custom tool')
+			.legacyNames('first')
+			.input(z.object({}))
+			.handler(async () => await Promise.resolve({ ok: true }))
+			.build();
+
+		expect(() => makeAgent().tool([first, second])).toThrow(
+			'Static tool name collision — the following tool names resolve to duplicates: first',
+		);
+	});
+
 	it('allows official SDK built-in tools to be registered', () => {
 		const agent = makeAgent().tool(createDelegateSubAgentTool()).tool(createWriteTodosTool());
 
